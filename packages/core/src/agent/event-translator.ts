@@ -210,7 +210,7 @@ export function translateEvent(
       out.push(
         makeEvent('error', state, {
           status: 'PERMISSION_DENIED',
-          message: `Agent execution blocked: ${event.value.systemMessage?.trim() || event.value.reason}`,
+          message: event.value.systemMessage?.trim() || event.value.reason,
           fatal: false,
           _meta: { code: 'AGENT_EXECUTION_BLOCKED' },
         }),
@@ -222,8 +222,15 @@ export function translateEvent(
       out.push(
         makeEvent('error', state, {
           status: 'INTERNAL',
-          message: 'Invalid stream received from model',
+          message:
+            event.value?.message?.trim() ||
+            'Invalid stream received from model',
           fatal: true,
+          _meta: {
+            code: 'INVALID_STREAM',
+            errorType: event.value?.type,
+            rawMessage: event.value?.message,
+          },
         }),
       );
       break;
@@ -236,6 +243,7 @@ export function translateEvent(
           requestId: event.value.callId,
           name: event.value.name,
           args: event.value.args,
+          display: event.value.display,
         }),
       );
       break;
@@ -243,13 +251,15 @@ export function translateEvent(
     case GeminiEventType.ToolCallResponse: {
       ensureStreamStart(state, out);
       const data = buildToolResponseData(event.value);
-      const display: ToolDisplay | undefined = event.value.resultDisplay
-        ? {
-            result: toolResultDisplayToDisplayContent(
-              event.value.resultDisplay,
-            ),
-          }
-        : undefined;
+      const display: ToolDisplay | undefined =
+        event.value.display ??
+        (event.value.resultDisplay
+          ? {
+              result: toolResultDisplayToDisplayContent(
+                event.value.resultDisplay,
+              ),
+            }
+          : undefined);
       out.push(
         makeEvent('tool_response', state, {
           requestId: event.value.callId,
@@ -279,7 +289,6 @@ export function translateEvent(
       ((x: never) => {
         throw new Error(`Unhandled event type: ${JSON.stringify(x)}`);
       })(event);
-      break;
   }
 
   return out;

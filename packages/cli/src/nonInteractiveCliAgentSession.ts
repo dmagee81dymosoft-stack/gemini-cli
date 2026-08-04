@@ -39,6 +39,12 @@ import {
   geminiPartsToContentParts,
   displayContentToString,
   debugLogger,
+  THINKING_ONLY_COMPRESS_SUGGESTION,
+  MAX_TOKENS_EXCEEDED_SUGGESTION,
+  SAFETY_BLOCKED_MESSAGE,
+  RECITATION_BLOCKED_MESSAGE,
+  OTHER_BLOCKED_MESSAGE,
+  TRUE_EMPTY_RESPONSE_MESSAGE,
 } from '@google/gemini-cli-core';
 
 import type { Part } from '@google/genai';
@@ -59,6 +65,13 @@ interface RunNonInteractiveParams {
   resumedSessionData?: ResumedSessionData;
 }
 
+/**
+ * Runs the non-interactive CLI using the LegacyAgentSession.
+ *
+ * Programmatic output formats (JSON, STREAM_JSON) use lenient sanitization
+ * by stripping ANSI escape sequences from messages to ensure clean,
+ * parseable output for downstream consumers.
+ */
 export async function runNonInteractive({
   config,
   settings,
@@ -80,7 +93,7 @@ export async function runNonInteractive({
       const { setupInitialActivityLogger } = await import(
         './utils/devtoolsService.js'
       );
-      await setupInitialActivityLogger(config);
+      setupInitialActivityLogger(config);
     }
 
     const { stdout: workingStdout } = createWorkingStdio();
@@ -325,21 +338,30 @@ export async function runNonInteractive({
         return text ? text : undefined;
       };
 
-      const emitFinalSuccessResult = (): void => {
+      const emitFinalResult = (errorPayload?: {
+        type: string;
+        message: string;
+      }): void => {
         if (streamFormatter) {
           const metrics = uiTelemetryService.getMetrics();
           const durationMs = Date.now() - startTime;
           streamFormatter.emitEvent({
             type: JsonStreamEventType.RESULT,
             timestamp: new Date().toISOString(),
-            status: 'success',
+            status: errorPayload ? 'error' : 'success',
             stats: streamFormatter.convertToStreamStats(metrics, durationMs),
           });
         } else if (config.getOutputFormat() === OutputFormat.JSON) {
           const formatter = new JsonFormatter();
           const stats = uiTelemetryService.getMetrics();
           textOutput.write(
-            formatter.format(config.getSessionId(), responseText, stats),
+            formatter.format(
+              config.getSessionId(),
+              responseText,
+              stats,
+              errorPayload,
+              warnings,
+            ),
           );
         } else {
           textOutput.ensureTrailingNewline();
@@ -420,6 +442,7 @@ export async function runNonInteractive({
       let responseText = '';
       let preToolResponseText: string | undefined;
       let streamEnded = false;
+      const warnings: string[] = [];
       for await (const event of session.stream({ streamId })) {
         if (streamEnded) break;
         switch (event.type) {
@@ -531,6 +554,52 @@ export async function runNonInteractive({
             break;
           }
           case 'error': {
+            if (event._meta?.['code'] === 'INVALID_STREAM') {
+              const errorTypeVal = event._meta?.['errorType'];
+              const errorType =
+                typeof errorTypeVal === 'string' ? errorTypeVal : undefined;
+
+              let errorMessage = event.message;
+              if (errorType === 'NO_RESPONSE_TEXT') {
+                errorMessage = TRUE_EMPTY_RESPONSE_MESSAGE;
+              } else if (errorType === 'THINKING_ONLY_RESPONSE') {
+                errorMessage = THINKING_ONLY_COMPRESS_SUGGESTION;
+              } else if (errorType === 'MAX_TOKENS_EXCEEDED') {
+                errorMessage = MAX_TOKENS_EXCEEDED_SUGGESTION;
+              } else if (errorType === 'SAFETY_BLOCKED') {
+                errorMessage = SAFETY_BLOCKED_MESSAGE;
+              } else if (errorType === 'RECITATION_BLOCKED') {
+                errorMessage = RECITATION_BLOCKED_MESSAGE;
+              } else if (errorType === 'OTHER_BLOCKED') {
+                errorMessage = OTHER_BLOCKED_MESSAGE;
+              }
+
+              if (streamFormatter) {
+                streamFormatter.emitEvent({
+                  type: JsonStreamEventType.ERROR,
+                  timestamp: new Date().toISOString(),
+                  severity: 'error',
+                  message: errorMessage,
+                });
+              } else if (config.getOutputFormat() === OutputFormat.TEXT) {
+                process.stderr.write(`[ERROR] ${errorMessage}\n`);
+              }
+
+              // Log semantic error telemetry without double-counting requests
+              uiTelemetryService.recordSemanticValidationError(
+                geminiClient.getCurrentSequenceModel() ?? config.getModel(),
+                errorType || 'INVALID_STREAM',
+              );
+
+              // If it's a fatal stream error, we should terminate and output final results
+              emitFinalResult({
+                type: 'INVALID_STREAM',
+                message: errorMessage,
+              });
+              streamEnded = true;
+              break;
+            }
+
             if (event.fatal) {
               throw reconstructFatalError(event);
             }
@@ -538,9 +607,18 @@ export async function runNonInteractive({
             const errorCode = event._meta?.['code'];
 
             if (errorCode === 'AGENT_EXECUTION_BLOCKED') {
+              const blockMessage = `Agent execution blocked: ${event.message.trim()}`;
               if (config.getOutputFormat() === OutputFormat.TEXT) {
-                process.stderr.write(`[WARNING] ${event.message}\n`);
+                process.stderr.write(`[WARNING] ${blockMessage}\n`);
+              } else if (streamFormatter) {
+                streamFormatter.emitEvent({
+                  type: JsonStreamEventType.ERROR,
+                  timestamp: new Date().toISOString(),
+                  severity: 'warning',
+                  message: stripAnsi(blockMessage),
+                });
               }
+              warnings.push(blockMessage);
               break;
             }
 
@@ -554,9 +632,10 @@ export async function runNonInteractive({
                 type: JsonStreamEventType.ERROR,
                 timestamp: new Date().toISOString(),
                 severity,
-                message: event.message,
+                message: stripAnsi(event.message),
               });
             }
+            warnings.push(event.message);
             break;
           }
           case 'agent_end': {
@@ -589,7 +668,7 @@ export async function runNonInteractive({
               process.stderr.write(`Agent execution stopped: ${stopMessage}\n`);
             }
 
-            emitFinalSuccessResult();
+            emitFinalResult();
             streamEnded = true;
             break;
           }

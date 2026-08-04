@@ -30,6 +30,12 @@ import {
   ToolErrorType,
   Scheduler,
   ROOT_SCHEDULER_ID,
+  THINKING_ONLY_COMPRESS_SUGGESTION,
+  MAX_TOKENS_EXCEEDED_SUGGESTION,
+  SAFETY_BLOCKED_MESSAGE,
+  RECITATION_BLOCKED_MESSAGE,
+  OTHER_BLOCKED_MESSAGE,
+  TRUE_EMPTY_RESPONSE_MESSAGE,
 } from '@google/gemini-cli-core';
 
 import type { Content, Part } from '@google/genai';
@@ -56,11 +62,21 @@ interface RunNonInteractiveParams {
   resumedSessionData?: ResumedSessionData;
 }
 
+/**
+ * Runs the non-interactive CLI loop.
+ *
+ * Programmatic output formats (JSON, STREAM_JSON) use lenient sanitization
+ * by stripping ANSI escape sequences from messages to ensure clean,
+ * parseable output for downstream consumers.
+ */
 export async function runNonInteractive(
   params: RunNonInteractiveParams,
 ): Promise<void> {
   const useAgentSession = params.config.getAgentSessionNoninteractiveEnabled();
   if (useAgentSession) {
+    debugLogger.debug(
+      '[ADK] Running non-interactive mode with ADK agent session',
+    );
     return runNonInteractiveAgentSession(params);
   }
 
@@ -80,7 +96,7 @@ export async function runNonInteractive(
       const { setupInitialActivityLogger } = await import(
         './utils/devtoolsService.js'
       );
-      await setupInitialActivityLogger(config);
+      setupInitialActivityLogger(config);
     }
 
     const { stdout: workingStdout } = createWorkingStdio();
@@ -295,6 +311,8 @@ export async function runNonInteractive(
       let currentMessages: Content[] = [{ role: 'user', parts: query }];
 
       let turnCount = 0;
+      let invalidStreamError: string | undefined;
+      const warnings: string[] = [];
       while (true) {
         turnCount++;
         if (
@@ -310,7 +328,6 @@ export async function runNonInteractive(
           abortController.signal,
           prompt_id,
           undefined,
-          false,
           turnCount === 1 ? input : undefined,
         );
 
@@ -351,23 +368,27 @@ export async function runNonInteractive(
             }
             toolCallRequests.push(event.value);
           } else if (event.type === GeminiEventType.LoopDetected) {
+            const message = 'Loop detected, stopping execution';
             if (streamFormatter) {
               streamFormatter.emitEvent({
                 type: JsonStreamEventType.ERROR,
                 timestamp: new Date().toISOString(),
                 severity: 'warning',
-                message: 'Loop detected, stopping execution',
+                message,
               });
             }
+            warnings.push(message);
           } else if (event.type === GeminiEventType.MaxSessionTurns) {
+            const message = 'Maximum session turns exceeded';
             if (streamFormatter) {
               streamFormatter.emitEvent({
                 type: JsonStreamEventType.ERROR,
                 timestamp: new Date().toISOString(),
                 severity: 'error',
-                message: 'Maximum session turns exceeded',
+                message,
               });
             }
+            warnings.push(message);
           } else if (event.type === GeminiEventType.Error) {
             throw event.value.error;
           } else if (event.type === GeminiEventType.AgentExecutionStopped) {
@@ -388,13 +409,73 @@ export async function runNonInteractive(
                   durationMs,
                 ),
               });
+            } else if (config.getOutputFormat() === OutputFormat.JSON) {
+              const formatter = new JsonFormatter();
+              const stats = uiTelemetryService.getMetrics();
+              textOutput.write(
+                formatter.format(
+                  config.getSessionId(),
+                  responseText,
+                  stats,
+                  undefined,
+                  [...warnings, stopMessage],
+                ),
+              );
+            } else {
+              textOutput.ensureTrailingNewline(); // Ensure a final newline
             }
             return;
           } else if (event.type === GeminiEventType.AgentExecutionBlocked) {
             const blockMessage = `Agent execution blocked: ${event.value.systemMessage?.trim() || event.value.reason}`;
             if (config.getOutputFormat() === OutputFormat.TEXT) {
               process.stderr.write(`[WARNING] ${blockMessage}\n`);
+            } else if (streamFormatter) {
+              streamFormatter.emitEvent({
+                type: JsonStreamEventType.ERROR,
+                timestamp: new Date().toISOString(),
+                severity: 'warning',
+                message: stripAnsi(blockMessage),
+              });
             }
+            warnings.push(blockMessage);
+          } else if (event.type === GeminiEventType.InvalidStream) {
+            const eventValue = event.value;
+            if (eventValue?.type === 'NO_RESPONSE_TEXT') {
+              invalidStreamError = TRUE_EMPTY_RESPONSE_MESSAGE;
+            } else if (eventValue?.type === 'THINKING_ONLY_RESPONSE') {
+              invalidStreamError = THINKING_ONLY_COMPRESS_SUGGESTION;
+            } else if (eventValue?.type === 'MAX_TOKENS_EXCEEDED') {
+              invalidStreamError = MAX_TOKENS_EXCEEDED_SUGGESTION;
+            } else if (eventValue?.type === 'SAFETY_BLOCKED') {
+              invalidStreamError = SAFETY_BLOCKED_MESSAGE;
+            } else if (eventValue?.type === 'RECITATION_BLOCKED') {
+              invalidStreamError = RECITATION_BLOCKED_MESSAGE;
+            } else if (eventValue?.type === 'OTHER_BLOCKED') {
+              invalidStreamError = OTHER_BLOCKED_MESSAGE;
+            } else {
+              invalidStreamError =
+                eventValue?.message?.trim() ||
+                'Invalid stream: The model returned an empty response or malformed tool call.';
+            }
+
+            // Log semantic error telemetry without double-counting requests
+            uiTelemetryService.recordSemanticValidationError(
+              geminiClient.getCurrentSequenceModel() ?? config.getModel(),
+              eventValue?.type || 'INVALID_STREAM',
+            );
+
+            if (streamFormatter) {
+              streamFormatter.emitEvent({
+                type: JsonStreamEventType.ERROR,
+                timestamp: new Date().toISOString(),
+                severity: 'error',
+                message: invalidStreamError,
+              });
+            } else if (config.getOutputFormat() === OutputFormat.TEXT) {
+              process.stderr.write(`[ERROR] ${invalidStreamError}\n`);
+            }
+            toolCallRequests.length = 0;
+            break;
           }
         }
 
@@ -491,7 +572,13 @@ export async function runNonInteractive(
               const formatter = new JsonFormatter();
               const stats = uiTelemetryService.getMetrics();
               textOutput.write(
-                formatter.format(config.getSessionId(), responseText, stats),
+                formatter.format(
+                  config.getSessionId(),
+                  responseText,
+                  stats,
+                  undefined,
+                  warnings,
+                ),
               );
             } else {
               textOutput.ensureTrailingNewline(); // Ensure a final newline
@@ -508,14 +595,22 @@ export async function runNonInteractive(
             streamFormatter.emitEvent({
               type: JsonStreamEventType.RESULT,
               timestamp: new Date().toISOString(),
-              status: 'success',
+              status: invalidStreamError ? 'error' : 'success',
               stats: streamFormatter.convertToStreamStats(metrics, durationMs),
             });
           } else if (config.getOutputFormat() === OutputFormat.JSON) {
             const formatter = new JsonFormatter();
             const stats = uiTelemetryService.getMetrics();
             textOutput.write(
-              formatter.format(config.getSessionId(), responseText, stats),
+              formatter.format(
+                config.getSessionId(),
+                responseText,
+                stats,
+                invalidStreamError
+                  ? { type: 'INVALID_STREAM', message: invalidStreamError }
+                  : undefined,
+                warnings,
+              ),
             );
           } else {
             textOutput.ensureTrailingNewline(); // Ensure a final newline
